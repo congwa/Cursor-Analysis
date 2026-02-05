@@ -1,0 +1,1 @@
+export { ChatDetailModal } from './ChatDetailModal'

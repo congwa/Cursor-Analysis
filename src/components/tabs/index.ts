@@ -1,0 +1,6 @@
+export { OverviewTab } from './OverviewTab'
+export { StorageTab } from './StorageTab'
+export { DatabaseTab } from './DatabaseTab'
+export { ProjectsTab } from './ProjectsTab'
+export { WorkspacesTab } from './WorkspacesTab'
+export { TrashTab } from './TrashTab'

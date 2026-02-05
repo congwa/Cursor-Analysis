@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 全局样式 */
+@layer base {
+  :root {
+    --background: 210 11% 7%;
+    --foreground: 210 17% 90%;
+    --card: 210 11% 11%;
+    --card-foreground: 210 17% 90%;
+    --popover: 210 13% 13%;
+    --popover-foreground: 210 17% 90%;
+    --primary: 212 100% 67%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 210 9% 15%;
+    --secondary-foreground: 210 9% 58%;
+    --muted: 210 9% 15%;
+    --muted-foreground: 210 9% 58%;
+    --accent: 140 63% 35%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 4 90% 63%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 210 10% 21%;
+    --input: 210 9% 15%;
+    --ring: 212 100% 67%;
+    --radius: 0.5rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+}
+
+/* 滚动条样式 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #161b22;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #484f58;
+}
+
+/* 代码字体 */
+code, pre, .font-mono {
+  font-family: 'Fira Code', monospace;
+}
+
+/* 动画 */
+@layer utilities {
+  .animate-in {
+    animation: animateIn 0.2s ease-out;
+  }
+  
+  @keyframes animateIn {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
