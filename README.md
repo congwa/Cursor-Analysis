@@ -5,6 +5,8 @@
 ## 产品概述
 
 Cursor Analysis 是一款专为 macOS 用户打造的桌面应用程序，用于深度分析 Cursor IDE 的使用情况。通过解析 Cursor 本地存储的 SQLite 数据库，为开发者提供全面的使用洞察，包括项目统计、代码贡献、会话管理和存储优化建议。
+
+![Cursor界面](cursor.png)
 ![参考图](image.png)
 ### 核心价值
 
@@ -196,6 +198,13 @@ pnpm run bump:minor   # 次要版本升级 1.0.0 → 1.1.0
 pnpm run bump:major   # 主要版本升级 1.0.0 → 2.0.0
 pnpm run release      # 自动升级版本并构建 Universal Binary
 ```
+
+---
+
+## 仓库地址
+
+- **GitHub**: https://github.com/congwa/Cursor-Analysis
+- **Gitee**: https://gitee.com/cong_wa/cursor-analysis.git
 
 ---
 
