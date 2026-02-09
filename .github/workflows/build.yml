@@ -36,6 +36,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup GitHub image links
+        run: |
+          echo "切换到 GitHub 模式 - 使用 HTTP 图床链接..."
+          chmod +x ./scripts/image-processor.sh
+          ./scripts/image-processor.sh github
+
       - name: Install Rust stable
         uses: dtolnay/rust-action@stable
         with:
@@ -76,6 +82,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Setup GitHub image links
+        shell: bash
+        run: |
+          echo "切换到 GitHub 模式 - 使用 HTTP 图床链接..."
+          chmod +x ./scripts/image-processor.sh
+          ./scripts/image-processor.sh github
 
       - name: Install Rust stable
         uses: dtolnay/rust-action@stable

@@ -6,8 +6,8 @@
 
 Cursor Analysis 是一款专为 macOS 用户打造的桌面应用程序，用于深度分析 Cursor IDE 的使用情况。通过解析 Cursor 本地存储的 SQLite 数据库，为开发者提供全面的使用洞察，包括项目统计、代码贡献、会话管理和存储优化建议。
 
-![Cursor界面](cursor.png)
-![参考图](image.png)
+![Cursor界面](https://raw.githubusercontent.com/congwa/Cursor-Analysis/main/cursor.png)
+![参考图](https://raw.githubusercontent.com/congwa/Cursor-Analysis/main/image.png)
 ### 核心价值
 
 - **数据可视化**：将 Cursor 的使用数据转化为直观的图表和统计信息
@@ -205,6 +205,28 @@ pnpm run release      # 自动升级版本并构建 Universal Binary
 
 - **GitHub**: https://github.com/congwa/Cursor-Analysis
 - **Gitee**: https://gitee.com/cong_wa/cursor-analysis.git
+
+---
+
+## 📸 图片显示说明
+
+本项目支持多平台图片显示优化：
+
+### 🔄 自动切换
+- **GitHub**: 自动使用 HTTP 图床链接，确保在 Windsurf 等工具中正常显示
+- **Gitee**: 使用本地图片引用，加载速度更快
+
+### 🛠️ 手动切换
+```bash
+# 快速切换（推荐）
+./quick-switch.sh
+
+# 或手动指定平台
+./scripts/image-processor.sh github  # 切换到 GitHub 模式
+./scripts/image-processor.sh gitee   # 切换到 Gitee 模式
+```
+
+详细说明请参考：[scripts/README-image-processor.md](scripts/README-image-processor.md)
 
 ---
 
