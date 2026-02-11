@@ -29,7 +29,6 @@
     "targets": [
       "dmg",
       "app",
-      "msi",
       "nsis"
     ],
     "icon": [
