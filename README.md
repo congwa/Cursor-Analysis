@@ -1,5 +1,7 @@
 # Cursor Analysis
 
+> 由于手动删除cursor的本地数据库sql文件内容，会导致cursor变得卡顿，无法分析到具体原因，本项目不再维护。 本项目现提供功能仅当分析cursor本地数据库信息使用。当一个分析工具，后续有需要会加一个导出excel功能。
+
 > macOS 专属的 Cursor IDE 使用分析工具
 
 ## 产品概述
