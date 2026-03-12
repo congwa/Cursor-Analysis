@@ -1,9 +1,3 @@
-# Windows 交叉编译配置 (从 macOS 构建 Windows)
-[target.x86_64-pc-windows-msvc]
-linker = "/usr/local/opt/llvm/bin/lld-link"
-rustflags = [
-    "-Clinker-flavor=lld-link",
-    "-Lnative=/Users/cong/Library/Caches/cargo-xwin/xwin/crt/lib/x86_64",
-    "-Lnative=/Users/cong/Library/Caches/cargo-xwin/xwin/sdk/lib/um/x86_64",
-    "-Lnative=/Users/cong/Library/Caches/cargo-xwin/xwin/sdk/lib/ucrt/x86_64",
-]
+# Cross-compilation config removed.
+# The macOS-specific cross-compile settings (lld-link, xwin paths) were breaking
+# native Windows builds. The build-windows.sh script sets these via env vars when needed.
