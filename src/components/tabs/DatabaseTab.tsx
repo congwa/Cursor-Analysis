@@ -98,7 +98,10 @@ export function DatabaseTab({ data }: DatabaseTabProps) {
                   backgroundColor: '#161b22',
                   border: '1px solid #30363d',
                   borderRadius: '8px',
+                  color: '#e6edf3',
                 }}
+                labelStyle={{ color: '#e6edf3' }}
+                itemStyle={{ color: '#e6edf3' }}
               />
               <Legend />
             </PieChart>
