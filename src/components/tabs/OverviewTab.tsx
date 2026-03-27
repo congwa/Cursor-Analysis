@@ -122,7 +122,10 @@ export function OverviewTab({ data }: OverviewTabProps) {
                     backgroundColor: '#161b22',
                     border: '1px solid #30363d',
                     borderRadius: '8px',
+                    color: '#e6edf3',
                   }}
+                  labelStyle={{ color: '#e6edf3' }}
+                  itemStyle={{ color: '#e6edf3' }}
                 />
                 <Legend />
               </PieChart>
@@ -161,7 +164,10 @@ export function OverviewTab({ data }: OverviewTabProps) {
                     backgroundColor: '#161b22',
                     border: '1px solid #30363d',
                     borderRadius: '8px',
+                    color: '#e6edf3',
                   }}
+                  labelStyle={{ color: '#e6edf3' }}
+                  itemStyle={{ color: '#e6edf3' }}
                 />
                 <Legend />
                 <Bar dataKey="added" fill="#3fb950" name="添加行数" />

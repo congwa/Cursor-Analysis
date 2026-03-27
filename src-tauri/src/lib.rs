@@ -1,9 +1,11 @@
 use chrono::{TimeZone, Utc};
-use rusqlite::Connection;
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 use walkdir::WalkDir;
 
 // 应用版本号
@@ -180,6 +182,135 @@ fn timestamp_to_string(ts: i64) -> Option<String> {
     }
 }
 
+fn open_sqlite_readonly(db_path: &PathBuf) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = conn.busy_timeout(Duration::from_millis(800));
+    Ok(conn)
+}
+
+fn sqlite_value_to_string(v: ValueRef<'_>) -> Option<String> {
+    match v {
+        ValueRef::Text(t) => std::str::from_utf8(t).ok().map(|s| s.to_string()),
+        ValueRef::Blob(b) => std::str::from_utf8(b).ok().map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+fn is_uuid_like(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if b != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                let is_hex = matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F');
+                if !is_hex {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn query_item_table_value(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM ItemTable WHERE key = ?1",
+        [key],
+        |row| Ok(sqlite_value_to_string(row.get_ref(0)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+fn query_cursor_disk_kv_value(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM cursorDiskKV WHERE key = ?1",
+        [key],
+        |row| Ok(sqlite_value_to_string(row.get_ref(0)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+fn extract_workspace_composer_ids(conn: &Connection) -> Vec<String> {
+    let mut ids: HashSet<String> = HashSet::new();
+
+    // 1) 从 composer.composerData 中提取（新格式里只有 selected/lastFocused）
+    if let Some(json_str) = query_item_table_value(conn, "composer.composerData") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            if let Some(obj) = v.as_object() {
+                for k in [
+                    "selectedComposerIds",
+                    "lastFocusedComposerIds",
+                    "composerIds",
+                    "allComposerIds",
+                ] {
+                    if let Some(arr) = obj.get(k).and_then(|x| x.as_array()) {
+                        for s in arr.iter().filter_map(|x| x.as_str()) {
+                            if is_uuid_like(s) {
+                                ids.insert(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) 从 workbench.panel.composerChatViewPane.* 的 value 中提取
+    // value 结构形如：
+    // { "workbench.panel.aichat.view.<composerId>": { ... } }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT value FROM ItemTable WHERE key LIKE 'workbench.panel.composerChatViewPane.%'",
+    ) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                let json_str = match row.get_ref(0).ok().and_then(sqlite_value_to_string) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+                    continue;
+                };
+                let Some(obj) = v.as_object() else {
+                    continue;
+                };
+                for prop in obj.keys() {
+                    // 最常见：workbench.panel.aichat.view.<uuid>
+                    if let Some(rest) = prop.strip_prefix("workbench.panel.aichat.view.") {
+                        if is_uuid_like(rest) {
+                            ids.insert(rest.to_string());
+                        }
+                        continue;
+                    }
+                    // 兜底：取最后一个 '.' 之后的片段
+                    if let Some(pos) = prop.rfind('.') {
+                        let candidate = &prop[pos + 1..];
+                        if is_uuid_like(candidate) {
+                            ids.insert(candidate.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<String> = ids.into_iter().collect();
+    result.sort();
+    result
+}
+
 // ==================== 存储分析 ====================
 
 #[tauri::command]
@@ -222,7 +353,7 @@ fn get_storage_info() -> Result<StorageInfo, String> {
 fn get_database_stats() -> Result<DatabaseStats, String> {
     let db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
     
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let conn = open_sqlite_readonly(&db_path).map_err(|e| e.to_string())?;
     
     // ItemTable 统计
     let item_count: i64 = conn
@@ -271,11 +402,19 @@ fn get_database_stats() -> Result<DatabaseStats, String> {
     
     // agentKv 统计
     let agent_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'agentKv:%'", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'agentKv:%' OR key LIKE 'agentKV:%'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap_or(0);
     
     let agent_size: i64 = conn
-        .query_row("SELECT COALESCE(SUM(LENGTH(value)), 0) FROM cursorDiskKV WHERE key LIKE 'agentKv:%'", [], |row| row.get(0))
+        .query_row(
+            "SELECT COALESCE(SUM(LENGTH(value)), 0) FROM cursorDiskKV WHERE key LIKE 'agentKv:%' OR key LIKE 'agentKV:%'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap_or(0);
     
     Ok(DatabaseStats {
@@ -330,6 +469,101 @@ fn parse_composer_data(json_str: &str) -> Vec<ChatSession> {
     sessions
 }
 
+fn parse_session_from_global_composer_data(json_str: &str, fallback_id: &str) -> Option<ChatSession> {
+    let data = serde_json::from_str::<serde_json::Value>(json_str).ok()?;
+    let id = data
+        .get("composerId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback_id)
+        .to_string();
+
+    Some(ChatSession {
+        id,
+        name: data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unnamed")
+            .to_string(),
+        mode: data
+            .get("unifiedMode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        created_at: data
+            .get("createdAt")
+            .and_then(|v| v.as_i64())
+            .and_then(timestamp_to_string),
+        updated_at: data
+            .get("lastUpdatedAt")
+            .and_then(|v| v.as_i64())
+            .and_then(timestamp_to_string),
+        lines_added: data
+            .get("totalLinesAdded")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        lines_removed: data
+            .get("totalLinesRemoved")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        files_changed: data
+            .get("filesChangedCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        context_usage: data
+            .get("contextUsagePercent")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        branch: data
+            .get("createdOnBranch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_archived: data
+            .get("isArchived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        subtitle: data
+            .get("subtitle")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(100)
+            .collect(),
+    })
+}
+
+fn get_workspace_sessions(workspace_conn: &Connection, global_conn: &Connection) -> Vec<ChatSession> {
+    // 旧版本：composer.composerData 直接包含 allComposers
+    if let Some(json_str) = query_item_table_value(workspace_conn, "composer.composerData") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            if v.get("allComposers").and_then(|x| x.as_array()).is_some() {
+                return parse_composer_data(&json_str);
+            }
+        }
+    }
+
+    // 新版本：workspace DB 里只存 UI 状态，需要从全局 DB 的 composerData:<id> 拉取
+    let composer_ids = extract_workspace_composer_ids(workspace_conn);
+    if composer_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sessions = Vec::new();
+    for cid in composer_ids {
+        let key = format!("composerData:{}", cid);
+        let Some(json_str) = query_cursor_disk_kv_value(global_conn, &key) else {
+            continue;
+        };
+        if let Some(s) = parse_session_from_global_composer_data(&json_str, &cid) {
+            sessions.push(s);
+        }
+    }
+
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions
+}
+
 fn get_workspace_projects(ws_json_path: &PathBuf) -> Vec<String> {
     if let Ok(content) = fs::read_to_string(ws_json_path) {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -352,6 +586,8 @@ fn get_workspace_projects(ws_json_path: &PathBuf) -> Vec<String> {
 #[tauri::command]
 fn get_all_projects() -> Result<Vec<ProjectStats>, String> {
     let workspace_storage = get_cursor_user_path().join("workspaceStorage");
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_readonly(&global_db_path).map_err(|e| e.to_string())?;
     
     let mut projects: HashMap<String, ProjectStats> = HashMap::new();
     
@@ -383,42 +619,37 @@ fn get_all_projects() -> Result<Vec<ProjectStats>, String> {
             
             // 从数据库获取会话
             if db_path.exists() {
-                if let Ok(conn) = Connection::open(&db_path) {
-                    if let Ok(mut stmt) = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'") {
-                        if let Ok(mut rows) = stmt.query([]) {
-                            if let Ok(Some(row)) = rows.next() {
-                                if let Ok(value) = row.get::<_, String>(0) {
-                                    let sessions = parse_composer_data(&value);
-                                    
-                                    let lines_added: i64 = sessions.iter().map(|s| s.lines_added).sum();
-                                    let lines_removed: i64 = sessions.iter().map(|s| s.lines_removed).sum();
-                                    let files_changed: i64 = sessions.iter().map(|s| s.files_changed).sum();
-                                    
-                                    let project_name = project_path
-                                        .split('/')
-                                        .last()
-                                        .unwrap_or(&project_path)
-                                        .to_string();
-                                    
-                                    let entry = projects.entry(project_path.clone()).or_insert(ProjectStats {
-                                        name: project_name,
-                                        path: project_path.clone(),
-                                        chat_count: 0,
-                                        lines_added: 0,
-                                        lines_removed: 0,
-                                        files_changed: 0,
-                                        chats: Vec::new(),
-                                    });
-                                    
-                                    entry.chat_count += sessions.len() as i64;
-                                    entry.lines_added += lines_added;
-                                    entry.lines_removed += lines_removed;
-                                    entry.files_changed += files_changed;
-                                    entry.chats.extend(sessions);
-                                }
-                            }
-                        }
+                if let Ok(conn) = open_sqlite_readonly(&db_path) {
+                    let sessions = get_workspace_sessions(&conn, &global_conn);
+                    if sessions.is_empty() {
+                        continue;
                     }
+
+                    let lines_added: i64 = sessions.iter().map(|s| s.lines_added).sum();
+                    let lines_removed: i64 = sessions.iter().map(|s| s.lines_removed).sum();
+                    let files_changed: i64 = sessions.iter().map(|s| s.files_changed).sum();
+
+                    let project_name = project_path
+                        .split('/')
+                        .last()
+                        .unwrap_or(&project_path)
+                        .to_string();
+
+                    let entry = projects.entry(project_path.clone()).or_insert(ProjectStats {
+                        name: project_name,
+                        path: project_path.clone(),
+                        chat_count: 0,
+                        lines_added: 0,
+                        lines_removed: 0,
+                        files_changed: 0,
+                        chats: Vec::new(),
+                    });
+
+                    entry.chat_count += sessions.len() as i64;
+                    entry.lines_added += lines_added;
+                    entry.lines_removed += lines_removed;
+                    entry.files_changed += files_changed;
+                    entry.chats.extend(sessions);
                 }
             }
         }
@@ -436,6 +667,8 @@ fn get_all_projects() -> Result<Vec<ProjectStats>, String> {
 #[tauri::command]
 fn get_workspaces() -> Result<Vec<WorkspaceInfo>, String> {
     let workspace_storage = get_cursor_user_path().join("workspaceStorage");
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_readonly(&global_db_path).map_err(|e| e.to_string())?;
     
     let mut workspaces = Vec::new();
     
@@ -486,23 +719,15 @@ fn get_workspaces() -> Result<Vec<WorkspaceInfo>, String> {
             
             // 从数据库获取统计
             if db_path.exists() {
-                if let Ok(conn) = Connection::open(&db_path) {
-                    if let Ok(mut stmt) = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'") {
-                        if let Ok(mut rows) = stmt.query([]) {
-                            if let Ok(Some(row)) = rows.next() {
-                                if let Ok(value) = row.get::<_, String>(0) {
-                                    let sessions = parse_composer_data(&value);
-                                    
-                                    info.chat_count = sessions.len() as i64;
-                                    info.lines_added = sessions.iter().map(|s| s.lines_added).sum();
-                                    info.lines_removed = sessions.iter().map(|s| s.lines_removed).sum();
-                                    info.files_changed = sessions.iter().map(|s| s.files_changed).sum();
-                                    // 返回所有会话，由前端进行分页和过滤
-                                    info.recent_chats = sessions;
-                                }
-                            }
-                        }
-                    }
+                if let Ok(conn) = open_sqlite_readonly(&db_path) {
+                    let sessions = get_workspace_sessions(&conn, &global_conn);
+
+                    info.chat_count = sessions.len() as i64;
+                    info.lines_added = sessions.iter().map(|s| s.lines_added).sum();
+                    info.lines_removed = sessions.iter().map(|s| s.lines_removed).sum();
+                    info.files_changed = sessions.iter().map(|s| s.files_changed).sum();
+                    // 返回所有会话，由前端进行分页和过滤
+                    info.recent_chats = sessions;
                 }
             }
             
@@ -746,65 +971,124 @@ fn find_workspace_db_by_project(project_path: &str) -> Option<PathBuf> {
     None
 }
 
+fn open_sqlite_rw(db_path: &PathBuf) -> Result<Connection, String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let _ = conn.busy_timeout(Duration::from_millis(800));
+    Ok(conn)
+}
+
+fn delete_chat_internal(
+    ws_conn: &Connection,
+    global_conn: &Connection,
+    chat_id: &str,
+    project_path: &str,
+) -> Result<bool, String> {
+    let mut deleted = false;
+    
+    // 1. 全局 DB 获取并保存到垃圾桶（新版本）
+    let global_key = format!("composerData:{}", chat_id);
+    if let Ok(Some(json_str)) = global_conn.query_row(
+        "SELECT value FROM cursorDiskKV WHERE key = ?1",
+        [&global_key],
+        |row| Ok(sqlite_value_to_string(row.get_ref(0).unwrap())),
+    ) {
+        if let Ok(chat_val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            let _ = add_to_trash(&chat_val, project_path);
+            deleted = true;
+        }
+    }
+    
+    // 2. 工作区 DB 更新 composer.composerData
+    if let Ok(mut stmt) = ws_conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'") {
+        if let Ok(value) = stmt.query_row([], |row| row.get::<_, String>(0)) {
+            if let Ok(mut data) = serde_json::from_str::<serde_json::Value>(&value) {
+                let mut data_changed = false;
+                
+                // 处理旧版本：allComposers 数组
+                if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
+                    let original_len = composers.len();
+                    
+                    if !deleted {
+                        for c in composers.iter() {
+                            if c.get("composerId").and_then(|v| v.as_str()) == Some(chat_id) {
+                                let _ = add_to_trash(c, project_path);
+                                deleted = true;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    composers.retain(|c| c.get("composerId").and_then(|v| v.as_str()) != Some(chat_id));
+                    if composers.len() < original_len {
+                        data_changed = true;
+                    }
+                }
+                
+                // 处理新版本：各个 ID 数组
+                if let Some(obj) = data.as_object_mut() {
+                    for k in ["selectedComposerIds", "lastFocusedComposerIds", "composerIds", "allComposerIds"] {
+                        if let Some(arr_val) = obj.get_mut(k) {
+                            if let Some(arr) = arr_val.as_array_mut() {
+                                let original_len = arr.len();
+                                arr.retain(|v| v.as_str() != Some(chat_id));
+                                if arr.len() < original_len {
+                                    data_changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if data_changed {
+                    if let Ok(new_value) = serde_json::to_string(&data) {
+                        let _ = ws_conn.execute(
+                            "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
+                            [&new_value],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    
+    // 3. 工作区 ItemTable 清理面板引用
+    let _ = ws_conn.execute(
+        "DELETE FROM ItemTable WHERE key = ?",
+        [format!("workbench.panel.aichat.view.{}", chat_id)],
+    );
+    
+    // 4. 从工作区和全局 DB 移除二进制及日志数据
+    let delete_from_conn = |conn: &Connection| {
+        let _ = conn.execute(
+            "DELETE FROM cursorDiskKV WHERE key = ?",
+            [format!("composerData:{}", chat_id)],
+        );
+        let _ = conn.execute(
+            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
+            [format!("bubbleId:{}:%", chat_id)],
+        );
+        let _ = conn.execute(
+            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
+            [format!("checkpointId:{}:%", chat_id)],
+        );
+    };
+    
+    delete_from_conn(ws_conn);
+    delete_from_conn(global_conn);
+    
+    Ok(true)
+}
+
 #[tauri::command]
 fn delete_chat(project_path: String, chat_id: String) -> Result<bool, String> {
-    // 找到对应的工作区数据库
     let db_path = find_workspace_db_by_project(&project_path)
         .ok_or_else(|| format!("找不到项目 {} 的数据库", project_path))?;
     
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let ws_conn = open_sqlite_rw(&db_path)?;
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_rw(&global_db_path)?;
     
-    // 读取现有的 composerData
-    let mut stmt = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-        .map_err(|e| e.to_string())?;
-    
-    let value: String = stmt.query_row([], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-    
-    // 解析 JSON
-    let mut data: serde_json::Value = serde_json::from_str(&value)
-        .map_err(|e| e.to_string())?;
-    
-    // 找到并保存到垃圾桶，然后删除
-    let mut found = false;
-    if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
-        // 先找到要删除的会话并保存到垃圾桶
-        for c in composers.iter() {
-            if c.get("composerId").and_then(|v| v.as_str()) == Some(&chat_id) {
-                let _ = add_to_trash(c, &project_path);
-                found = true;
-                break;
-            }
-        }
-        
-        if !found {
-            return Err("未找到指定的会话".to_string());
-        }
-        
-        // 过滤掉要删除的会话
-        composers.retain(|c| {
-            c.get("composerId").and_then(|v| v.as_str()) != Some(&chat_id)
-        });
-    }
-    
-    // 写回数据库
-    let new_value = serde_json::to_string(&data).map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
-        [&new_value],
-    ).map_err(|e| e.to_string())?;
-    
-    // 同时删除相关的 bubble 和 checkpoint 数据
-    let _ = conn.execute(
-        "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-        [format!("bubbleId:{}:%", chat_id)],
-    );
-    let _ = conn.execute(
-        "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-        [format!("checkpointId:{}:%", chat_id)],
-    );
-    
-    Ok(true)
+    delete_chat_internal(&ws_conn, &global_conn, &chat_id, &project_path)
 }
 
 #[tauri::command]
@@ -813,64 +1097,18 @@ fn delete_chats_batch(project_path: String, chat_ids: Vec<String>) -> Result<i64
         return Ok(0);
     }
     
-    // 找到对应的工作区数据库
     let db_path = find_workspace_db_by_project(&project_path)
         .ok_or_else(|| format!("找不到项目 {} 的数据库", project_path))?;
     
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let ws_conn = open_sqlite_rw(&db_path)?;
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_rw(&global_db_path)?;
     
-    // 读取现有的 composerData
-    let mut stmt = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-        .map_err(|e| e.to_string())?;
-    
-    let value: String = stmt.query_row([], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-    
-    // 解析 JSON
-    let mut data: serde_json::Value = serde_json::from_str(&value)
-        .map_err(|e| e.to_string())?;
-    
-    // 先保存到垃圾桶，然后删除
     let mut deleted_count = 0i64;
-    if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
-        // 先保存到垃圾桶
-        for c in composers.iter() {
-            if let Some(id) = c.get("composerId").and_then(|v| v.as_str()) {
-                if chat_ids.contains(&id.to_string()) {
-                    let _ = add_to_trash(c, &project_path);
-                }
-            }
+    for chat_id in chat_ids {
+        if delete_chat_internal(&ws_conn, &global_conn, &chat_id, &project_path).unwrap_or(false) {
+            deleted_count += 1;
         }
-        
-        // 过滤掉要删除的会话
-        let original_len = composers.len();
-        composers.retain(|c| {
-            if let Some(id) = c.get("composerId").and_then(|v| v.as_str()) {
-                !chat_ids.contains(&id.to_string())
-            } else {
-                true
-            }
-        });
-        deleted_count = (original_len - composers.len()) as i64;
-    }
-    
-    // 写回数据库
-    let new_value = serde_json::to_string(&data).map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
-        [&new_value],
-    ).map_err(|e| e.to_string())?;
-    
-    // 删除相关的 bubble 和 checkpoint 数据
-    for id in &chat_ids {
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("bubbleId:{}:%", id)],
-        );
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("checkpointId:{}:%", id)],
-        );
     }
     
     Ok(deleted_count)
@@ -878,60 +1116,20 @@ fn delete_chats_batch(project_path: String, chat_ids: Vec<String>) -> Result<i64
 
 #[tauri::command]
 fn delete_project_chats(project_path: String) -> Result<i64, String> {
-    // 找到对应的工作区数据库
     let db_path = find_workspace_db_by_project(&project_path)
         .ok_or_else(|| format!("找不到项目 {} 的数据库", project_path))?;
     
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let ws_conn = open_sqlite_rw(&db_path)?;
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_rw(&global_db_path)?;
     
-    // 读取现有的 composerData
-    let mut stmt = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-        .map_err(|e| e.to_string())?;
+    let sessions = get_workspace_sessions(&ws_conn, &global_conn);
+    let mut deleted_count = 0i64;
     
-    let value: String = stmt.query_row([], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-    
-    // 解析 JSON
-    let mut data: serde_json::Value = serde_json::from_str(&value)
-        .map_err(|e| e.to_string())?;
-    
-    // 收集所有要删除的会话 ID 并保存到垃圾桶
-    let mut deleted_ids: Vec<String> = Vec::new();
-    
-    if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
-        for c in composers.iter() {
-            if c.get("type").and_then(|v| v.as_str()) == Some("head") {
-                if let Some(id) = c.get("composerId").and_then(|v| v.as_str()) {
-                    // 保存到垃圾桶
-                    let _ = add_to_trash(c, &project_path);
-                    deleted_ids.push(id.to_string());
-                }
-            }
+    for session in sessions {
+        if delete_chat_internal(&ws_conn, &global_conn, &session.id, &project_path).unwrap_or(false) {
+            deleted_count += 1;
         }
-        
-        // 清空所有会话
-        composers.clear();
-    }
-    
-    let deleted_count = deleted_ids.len() as i64;
-    
-    // 写回数据库
-    let new_value = serde_json::to_string(&data).map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
-        [&new_value],
-    ).map_err(|e| e.to_string())?;
-    
-    // 删除相关的 bubble 和 checkpoint 数据
-    for id in &deleted_ids {
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("bubbleId:{}:%", id)],
-        );
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("checkpointId:{}:%", id)],
-        );
     }
     
     Ok(deleted_count)
@@ -947,7 +1145,6 @@ fn delete_workspace_chats(workspace_id: String) -> Result<i64, String> {
         return Err(format!("找不到工作区 {} 的数据库", workspace_id));
     }
     
-    // 获取工作区的项目路径用于垃圾桶记录
     let ws_json = ws_path.join("workspace.json");
     let project_path = if let Ok(content) = fs::read_to_string(&ws_json) {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -963,56 +1160,17 @@ fn delete_workspace_chats(workspace_id: String) -> Result<i64, String> {
         format!("[工作区] {}", workspace_id)
     };
     
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let ws_conn = open_sqlite_rw(&db_path)?;
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_rw(&global_db_path)?;
     
-    // 读取现有的 composerData
-    let mut stmt = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-        .map_err(|e| e.to_string())?;
+    let sessions = get_workspace_sessions(&ws_conn, &global_conn);
+    let mut deleted_count = 0i64;
     
-    let value: String = stmt.query_row([], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-    
-    // 解析 JSON
-    let mut data: serde_json::Value = serde_json::from_str(&value)
-        .map_err(|e| e.to_string())?;
-    
-    // 收集所有要删除的会话 ID 并保存到垃圾桶
-    let mut deleted_ids: Vec<String> = Vec::new();
-    
-    if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
-        for c in composers.iter() {
-            if c.get("type").and_then(|v| v.as_str()) == Some("head") {
-                if let Some(id) = c.get("composerId").and_then(|v| v.as_str()) {
-                    // 保存到垃圾桶
-                    let _ = add_to_trash(c, &project_path);
-                    deleted_ids.push(id.to_string());
-                }
-            }
+    for session in sessions {
+        if delete_chat_internal(&ws_conn, &global_conn, &session.id, &project_path).unwrap_or(false) {
+            deleted_count += 1;
         }
-        
-        // 清空所有会话
-        composers.clear();
-    }
-    
-    let deleted_count = deleted_ids.len() as i64;
-    
-    // 写回数据库
-    let new_value = serde_json::to_string(&data).map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
-        [&new_value],
-    ).map_err(|e| e.to_string())?;
-    
-    // 删除相关的 bubble 和 checkpoint 数据
-    for id in &deleted_ids {
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("bubbleId:{}:%", id)],
-        );
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("checkpointId:{}:%", id)],
-        );
     }
     
     Ok(deleted_count)
