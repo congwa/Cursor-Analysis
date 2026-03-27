@@ -971,65 +971,124 @@ fn find_workspace_db_by_project(project_path: &str) -> Option<PathBuf> {
     None
 }
 
+fn open_sqlite_rw(db_path: &PathBuf) -> Result<Connection, String> {
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let _ = conn.busy_timeout(Duration::from_millis(800));
+    Ok(conn)
+}
+
+fn delete_chat_internal(
+    ws_conn: &Connection,
+    global_conn: &Connection,
+    chat_id: &str,
+    project_path: &str,
+) -> Result<bool, String> {
+    let mut deleted = false;
+    
+    // 1. 全局 DB 获取并保存到垃圾桶（新版本）
+    let global_key = format!("composerData:{}", chat_id);
+    if let Ok(Some(json_str)) = global_conn.query_row(
+        "SELECT value FROM cursorDiskKV WHERE key = ?1",
+        [&global_key],
+        |row| Ok(sqlite_value_to_string(row.get_ref(0).unwrap())),
+    ) {
+        if let Ok(chat_val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            let _ = add_to_trash(&chat_val, project_path);
+            deleted = true;
+        }
+    }
+    
+    // 2. 工作区 DB 更新 composer.composerData
+    if let Ok(mut stmt) = ws_conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'") {
+        if let Ok(value) = stmt.query_row([], |row| row.get::<_, String>(0)) {
+            if let Ok(mut data) = serde_json::from_str::<serde_json::Value>(&value) {
+                let mut data_changed = false;
+                
+                // 处理旧版本：allComposers 数组
+                if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
+                    let original_len = composers.len();
+                    
+                    if !deleted {
+                        for c in composers.iter() {
+                            if c.get("composerId").and_then(|v| v.as_str()) == Some(chat_id) {
+                                let _ = add_to_trash(c, project_path);
+                                deleted = true;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    composers.retain(|c| c.get("composerId").and_then(|v| v.as_str()) != Some(chat_id));
+                    if composers.len() < original_len {
+                        data_changed = true;
+                    }
+                }
+                
+                // 处理新版本：各个 ID 数组
+                if let Some(obj) = data.as_object_mut() {
+                    for k in ["selectedComposerIds", "lastFocusedComposerIds", "composerIds", "allComposerIds"] {
+                        if let Some(arr_val) = obj.get_mut(k) {
+                            if let Some(arr) = arr_val.as_array_mut() {
+                                let original_len = arr.len();
+                                arr.retain(|v| v.as_str() != Some(chat_id));
+                                if arr.len() < original_len {
+                                    data_changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if data_changed {
+                    if let Ok(new_value) = serde_json::to_string(&data) {
+                        let _ = ws_conn.execute(
+                            "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
+                            [&new_value],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    
+    // 3. 工作区 ItemTable 清理面板引用
+    let _ = ws_conn.execute(
+        "DELETE FROM ItemTable WHERE key = ?",
+        [format!("workbench.panel.aichat.view.{}", chat_id)],
+    );
+    
+    // 4. 从工作区和全局 DB 移除二进制及日志数据
+    let delete_from_conn = |conn: &Connection| {
+        let _ = conn.execute(
+            "DELETE FROM cursorDiskKV WHERE key = ?",
+            [format!("composerData:{}", chat_id)],
+        );
+        let _ = conn.execute(
+            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
+            [format!("bubbleId:{}:%", chat_id)],
+        );
+        let _ = conn.execute(
+            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
+            [format!("checkpointId:{}:%", chat_id)],
+        );
+    };
+    
+    delete_from_conn(ws_conn);
+    delete_from_conn(global_conn);
+    
+    Ok(true)
+}
+
 #[tauri::command]
 fn delete_chat(project_path: String, chat_id: String) -> Result<bool, String> {
-    // 找到对应的工作区数据库
     let db_path = find_workspace_db_by_project(&project_path)
         .ok_or_else(|| format!("找不到项目 {} 的数据库", project_path))?;
     
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let ws_conn = open_sqlite_rw(&db_path)?;
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_rw(&global_db_path)?;
     
-    // 读取现有的 composerData
-    let mut stmt = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-        .map_err(|e| e.to_string())?;
-    
-    let value: String = stmt.query_row([], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-    
-    // 解析 JSON
-    let mut data: serde_json::Value = serde_json::from_str(&value)
-        .map_err(|e| e.to_string())?;
-    
-    // 找到并保存到垃圾桶，然后删除
-    let mut found = false;
-    if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
-        // 先找到要删除的会话并保存到垃圾桶
-        for c in composers.iter() {
-            if c.get("composerId").and_then(|v| v.as_str()) == Some(&chat_id) {
-                let _ = add_to_trash(c, &project_path);
-                found = true;
-                break;
-            }
-        }
-        
-        if !found {
-            return Err("未找到指定的会话".to_string());
-        }
-        
-        // 过滤掉要删除的会话
-        composers.retain(|c| {
-            c.get("composerId").and_then(|v| v.as_str()) != Some(&chat_id)
-        });
-    }
-    
-    // 写回数据库
-    let new_value = serde_json::to_string(&data).map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
-        [&new_value],
-    ).map_err(|e| e.to_string())?;
-    
-    // 同时删除相关的 bubble 和 checkpoint 数据
-    let _ = conn.execute(
-        "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-        [format!("bubbleId:{}:%", chat_id)],
-    );
-    let _ = conn.execute(
-        "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-        [format!("checkpointId:{}:%", chat_id)],
-    );
-    
-    Ok(true)
+    delete_chat_internal(&ws_conn, &global_conn, &chat_id, &project_path)
 }
 
 #[tauri::command]
@@ -1038,64 +1097,18 @@ fn delete_chats_batch(project_path: String, chat_ids: Vec<String>) -> Result<i64
         return Ok(0);
     }
     
-    // 找到对应的工作区数据库
     let db_path = find_workspace_db_by_project(&project_path)
         .ok_or_else(|| format!("找不到项目 {} 的数据库", project_path))?;
     
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let ws_conn = open_sqlite_rw(&db_path)?;
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_rw(&global_db_path)?;
     
-    // 读取现有的 composerData
-    let mut stmt = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-        .map_err(|e| e.to_string())?;
-    
-    let value: String = stmt.query_row([], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-    
-    // 解析 JSON
-    let mut data: serde_json::Value = serde_json::from_str(&value)
-        .map_err(|e| e.to_string())?;
-    
-    // 先保存到垃圾桶，然后删除
     let mut deleted_count = 0i64;
-    if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
-        // 先保存到垃圾桶
-        for c in composers.iter() {
-            if let Some(id) = c.get("composerId").and_then(|v| v.as_str()) {
-                if chat_ids.contains(&id.to_string()) {
-                    let _ = add_to_trash(c, &project_path);
-                }
-            }
+    for chat_id in chat_ids {
+        if delete_chat_internal(&ws_conn, &global_conn, &chat_id, &project_path).unwrap_or(false) {
+            deleted_count += 1;
         }
-        
-        // 过滤掉要删除的会话
-        let original_len = composers.len();
-        composers.retain(|c| {
-            if let Some(id) = c.get("composerId").and_then(|v| v.as_str()) {
-                !chat_ids.contains(&id.to_string())
-            } else {
-                true
-            }
-        });
-        deleted_count = (original_len - composers.len()) as i64;
-    }
-    
-    // 写回数据库
-    let new_value = serde_json::to_string(&data).map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
-        [&new_value],
-    ).map_err(|e| e.to_string())?;
-    
-    // 删除相关的 bubble 和 checkpoint 数据
-    for id in &chat_ids {
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("bubbleId:{}:%", id)],
-        );
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("checkpointId:{}:%", id)],
-        );
     }
     
     Ok(deleted_count)
@@ -1103,60 +1116,20 @@ fn delete_chats_batch(project_path: String, chat_ids: Vec<String>) -> Result<i64
 
 #[tauri::command]
 fn delete_project_chats(project_path: String) -> Result<i64, String> {
-    // 找到对应的工作区数据库
     let db_path = find_workspace_db_by_project(&project_path)
         .ok_or_else(|| format!("找不到项目 {} 的数据库", project_path))?;
     
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let ws_conn = open_sqlite_rw(&db_path)?;
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_rw(&global_db_path)?;
     
-    // 读取现有的 composerData
-    let mut stmt = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-        .map_err(|e| e.to_string())?;
+    let sessions = get_workspace_sessions(&ws_conn, &global_conn);
+    let mut deleted_count = 0i64;
     
-    let value: String = stmt.query_row([], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-    
-    // 解析 JSON
-    let mut data: serde_json::Value = serde_json::from_str(&value)
-        .map_err(|e| e.to_string())?;
-    
-    // 收集所有要删除的会话 ID 并保存到垃圾桶
-    let mut deleted_ids: Vec<String> = Vec::new();
-    
-    if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
-        for c in composers.iter() {
-            if c.get("type").and_then(|v| v.as_str()) == Some("head") {
-                if let Some(id) = c.get("composerId").and_then(|v| v.as_str()) {
-                    // 保存到垃圾桶
-                    let _ = add_to_trash(c, &project_path);
-                    deleted_ids.push(id.to_string());
-                }
-            }
+    for session in sessions {
+        if delete_chat_internal(&ws_conn, &global_conn, &session.id, &project_path).unwrap_or(false) {
+            deleted_count += 1;
         }
-        
-        // 清空所有会话
-        composers.clear();
-    }
-    
-    let deleted_count = deleted_ids.len() as i64;
-    
-    // 写回数据库
-    let new_value = serde_json::to_string(&data).map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
-        [&new_value],
-    ).map_err(|e| e.to_string())?;
-    
-    // 删除相关的 bubble 和 checkpoint 数据
-    for id in &deleted_ids {
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("bubbleId:{}:%", id)],
-        );
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("checkpointId:{}:%", id)],
-        );
     }
     
     Ok(deleted_count)
@@ -1172,7 +1145,6 @@ fn delete_workspace_chats(workspace_id: String) -> Result<i64, String> {
         return Err(format!("找不到工作区 {} 的数据库", workspace_id));
     }
     
-    // 获取工作区的项目路径用于垃圾桶记录
     let ws_json = ws_path.join("workspace.json");
     let project_path = if let Ok(content) = fs::read_to_string(&ws_json) {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -1188,56 +1160,17 @@ fn delete_workspace_chats(workspace_id: String) -> Result<i64, String> {
         format!("[工作区] {}", workspace_id)
     };
     
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let ws_conn = open_sqlite_rw(&db_path)?;
+    let global_db_path = get_cursor_user_path().join("globalStorage/state.vscdb");
+    let global_conn = open_sqlite_rw(&global_db_path)?;
     
-    // 读取现有的 composerData
-    let mut stmt = conn.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-        .map_err(|e| e.to_string())?;
+    let sessions = get_workspace_sessions(&ws_conn, &global_conn);
+    let mut deleted_count = 0i64;
     
-    let value: String = stmt.query_row([], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-    
-    // 解析 JSON
-    let mut data: serde_json::Value = serde_json::from_str(&value)
-        .map_err(|e| e.to_string())?;
-    
-    // 收集所有要删除的会话 ID 并保存到垃圾桶
-    let mut deleted_ids: Vec<String> = Vec::new();
-    
-    if let Some(composers) = data.get_mut("allComposers").and_then(|v| v.as_array_mut()) {
-        for c in composers.iter() {
-            if c.get("type").and_then(|v| v.as_str()) == Some("head") {
-                if let Some(id) = c.get("composerId").and_then(|v| v.as_str()) {
-                    // 保存到垃圾桶
-                    let _ = add_to_trash(c, &project_path);
-                    deleted_ids.push(id.to_string());
-                }
-            }
+    for session in sessions {
+        if delete_chat_internal(&ws_conn, &global_conn, &session.id, &project_path).unwrap_or(false) {
+            deleted_count += 1;
         }
-        
-        // 清空所有会话
-        composers.clear();
-    }
-    
-    let deleted_count = deleted_ids.len() as i64;
-    
-    // 写回数据库
-    let new_value = serde_json::to_string(&data).map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'",
-        [&new_value],
-    ).map_err(|e| e.to_string())?;
-    
-    // 删除相关的 bubble 和 checkpoint 数据
-    for id in &deleted_ids {
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("bubbleId:{}:%", id)],
-        );
-        let _ = conn.execute(
-            "DELETE FROM cursorDiskKV WHERE key LIKE ?",
-            [format!("checkpointId:{}:%", id)],
-        );
     }
     
     Ok(deleted_count)
